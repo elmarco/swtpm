@@ -135,7 +135,7 @@ if [ $size -ne $expsize ]; then
 fi
 
 hash=$(get_sha1_file $volatilestatefile)
-exphash="bafa4b918745dee45537484f1a1089f9967b7df7"
+exphash="695eec9c511f2b1846e63809e46571d53727ed36"
 if [ "$hash" != "$exphash" ]; then
 	echo "Error: The checksum of the volatile state file is wrong."
 	echo "       Calculated: $hash"

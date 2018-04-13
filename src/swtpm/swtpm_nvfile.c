@@ -65,15 +65,8 @@
 #include <libtpms/tpm_nvfilename.h>
 #include <libtpms/tpm_library.h>
 
-#ifdef USE_FREEBL_CRYPTO_LIBRARY
-# include <blapi.h>
-#else
-# ifdef USE_OPENSSL_CRYPTO_LIBRARY
-#  include <openssl/sha.h>
-# else
-#  error "Unsupported crypto library."
-# endif
-#endif
+#include <openssl/sha.h>
+#include <openssl/hmac.h>
 
 #include "swtpm_aes.h"
 #include "swtpm_debug.h"
@@ -91,7 +84,7 @@ typedef struct {
     uint32_t totlen; /* length of the header and following data */
 } __attribute__((packed)) blobheader;
 
-#define BLOB_HEADER_VERSION 1
+#define BLOB_HEADER_VERSION 2
 
 /* flags for blobheader */
 #define BLOB_FLAG_ENCRYPTED              0x1
@@ -132,7 +125,8 @@ static TPM_RESULT SWTPM_NVRAM_DecryptData(const encryptionkey *key,
                                           unsigned char **decrypt_data,
                                           uint32_t *decrypt_length,
                                           const unsigned char *encrypt_data,
-                                          uint32_t encrypt_length);
+                                          uint32_t encrypt_length,
+                                          uint8_t hdrversion);
 
 /* A file name in NVRAM is composed of 3 parts:
 
@@ -322,8 +316,14 @@ SWTPM_NVRAM_LoadData_Intern(unsigned char **data,     /* freed by caller */
     }
 
     if (rc == 0 && decrypt) {
-        rc = SWTPM_NVRAM_DecryptData(&filekey, &decrypt_data, &decrypt_length,
-                                     *data, *length);
+
+        uint8_t hdr_version;
+        for (hdr_version = BLOB_HEADER_VERSION; hdr_version > 0; hdr_version--) {
+            rc = SWTPM_NVRAM_DecryptData(&filekey, &decrypt_data, &decrypt_length,
+                                         *data, *length, hdr_version);
+            if (!rc)
+                break;
+        }
         TPM_DEBUG(" SWTPM_NVRAM_LoadData: SWTPM_NVRAM_DecryptData rc = %d\n",
                   rc);
         if (rc != 0)
@@ -610,63 +610,121 @@ TPM_RESULT SWTPM_NVRAM_Set_MigrationKey(const unsigned char *key,
     return rc;
 }
 
+/*
+ * SWTPM_PrependHMAC
+ *
+ * @in: input buffer to calculate HMAC on
+ * @in_length: length of input buffer
+ * @out: pointer to output buffer we allocate here
+ * @out_length: length of output buffer
+ * @tpm_symmetric_key_token: symmetric key
+ *
+ * Calculate an HMAC on the input buffer with payload and create an output
+ * buffer with the HMAC prepended to the payload.
+ */
 static TPM_RESULT
-SWTPM_PrependHash(const unsigned char *in, uint32_t in_length,
-                  unsigned char **out, uint32_t *out_length)
+SWTPM_PrependHMAC(const unsigned char *in, uint32_t in_length,
+                  unsigned char **out, uint32_t *out_length,
+                  const TPM_SYMMETRIC_KEY_DATA *tpm_symmetric_key_token)
 {
     TPM_RESULT rc = 0;
+    unsigned int md_len;
+    unsigned char md[EVP_MAX_MD_SIZE];
     unsigned char *dest;
-#ifdef USE_FREEBL_CRYPTO_LIBRARY
-    unsigned char hashbuf[SHA256_LENGTH];
-#else
-    unsigned char hashbuf[SHA256_DIGEST_LENGTH];
-#endif
 
-    /* hash the data */
-#ifdef USE_FREEBL_CRYPTO_LIBRARY
-    if (SHA256_HashBuf(hashbuf, in, in_length) != SECSuccess) {
-        logprintf(STDOUT_FILENO, "SHA256_HashBuff failed.\n");
-        rc = TPM_FAIL;
+    if (!HMAC(EVP_sha256(), tpm_symmetric_key_token->userKey,
+              TPM_AES_BLOCK_SIZE, in, in_length, md, &md_len)) {
+        logprintf(STDOUT_FILENO, "HMAC() call failed.\n");
+        return TPM_FAIL;
     }
-#else
-    SHA256(in, in_length, hashbuf);
-#endif
 
-    *out_length = sizeof(hashbuf) + in_length;
+    *out_length = md_len + in_length;
     rc = TPM_Malloc(out, *out_length);
 
     if (rc == TPM_SUCCESS) {
         dest = *out;
-        memcpy(dest, hashbuf, sizeof(hashbuf));
-        memcpy(&dest[sizeof(hashbuf)], in, in_length);
+        memcpy(dest, md, md_len);
+        memcpy(&dest[md_len], in, in_length);
     }
 
     return rc;
 }
 
+/*
+ * SWTPM_CheckHMAC:
+ *
+ * @in: input buffer
+ * @in_length: input buffer length
+ * @out: output buffer
+ * @out_length: output buffer length
+ * @tpm_symmetric_key_token: symmetric key
+ *
+ * The input buffer holds an HMAC at the beginning followed by the HMAC'ed
+ * payload. Verify the HMAC and copy the payload into an output buffer.
+ */
+static TPM_RESULT
+SWTPM_CheckHMAC(const unsigned char *in, uint32_t in_length,
+                unsigned char **out, uint32_t *out_length,
+                const TPM_SYMMETRIC_KEY_DATA *tpm_symmetric_key_token)
+{
+    TPM_RESULT rc = 0;
+    unsigned char *dest = NULL;
+    const unsigned char *data;
+    uint32_t data_length;
+    unsigned int md_len;
+    unsigned char md[EVP_MAX_MD_SIZE];
+
+    md_len = EVP_MD_size(EVP_sha256());
+    if (md_len > in_length) {
+        logprintf(STDOUT_FILENO, "Insufficient bytes for CheckHMAC()\n");
+        return TPM_FAIL;
+    }
+
+    data = &in[md_len];
+    data_length = in_length - md_len;
+
+    if (!HMAC(EVP_sha256(), tpm_symmetric_key_token->userKey,
+              TPM_AES_BLOCK_SIZE, data, data_length, md, &md_len)) {
+        logprintf(STDOUT_FILENO, "HMAC() call failed.\n");
+        return TPM_FAIL;
+    }
+
+    if (memcmp(in, md, md_len)) {
+        logprintf(STDOUT_FILENO, "Verification of hash failed. "
+                  "Data integrity is compromised\n");
+        return TPM_FAIL;
+    }
+
+    rc = TPM_Malloc(&dest, data_length);
+    if (rc == TPM_SUCCESS) {
+        *out = dest;
+        *out_length = data_length;
+        memcpy(dest, data, data_length);
+    }
+
+    return rc;
+}
+
+/*
+ * SWTPM_CheckHash:
+ *
+ * @in: input buffer
+ * @in_length: input buffer length
+ * @out: output buffer
+ * @out_length: output buffer length
+ */
 static TPM_RESULT
 SWTPM_CheckHash(const unsigned char *in, uint32_t in_length,
                 unsigned char **out, uint32_t *out_length)
 {
     TPM_RESULT rc = 0;
     unsigned char *dest = NULL;
-#ifdef USE_FREEBL_CRYPTO_LIBRARY
-    unsigned char hashbuf[SHA256_LENGTH];
-#else
     unsigned char hashbuf[SHA256_DIGEST_LENGTH];
-#endif
     const unsigned char *data = &in[sizeof(hashbuf)];
     uint32_t data_length = in_length - sizeof(hashbuf);
 
     /* hash the data */
-#ifdef USE_FREEBL_CRYPTO_LIBRARY
-    if (SHA256_HashBuf(hashbuf, data, data_length) != SECSuccess) {
-        logprintf(STDOUT_FILENO, "SHA256_HashBuff failed.\n");
-        rc = TPM_FAIL;
-    }
-#else
     SHA256(data, data_length, hashbuf);
-#endif
 
     if (memcmp(in, hashbuf, sizeof(hashbuf))) {
         logprintf(STDOUT_FILENO, "Verification of hash failed. "
@@ -694,8 +752,8 @@ SWTPM_NVRAM_EncryptData(const encryptionkey *key,
                         uint32_t decrypt_length)
 {
     TPM_RESULT rc = 0;
-    unsigned char *hashed_data = NULL;
-    uint32_t hashed_length = 0;
+    unsigned char *tmp_data = NULL;
+    uint32_t tmp_length = 0;
 
     if (rc == 0) {
         if (key->symkey.valid) {
@@ -704,16 +762,17 @@ SWTPM_NVRAM_EncryptData(const encryptionkey *key,
                 rc = TPM_BAD_MODE;
                 break;
             case ENCRYPTION_MODE_AES_CBC:
-                rc = SWTPM_PrependHash(decrypt_data, decrypt_length,
-                                       &hashed_data, &hashed_length);
+                rc = TPM_SymmetricKeyData_Encrypt(&tmp_data,
+                                                  &tmp_length,
+                                                  decrypt_data,
+                                                  decrypt_length,
+                                                  &key->symkey);
                 if (rc)
                      break;
-                rc = TPM_SymmetricKeyData_Encrypt(encrypt_data,
-                                                  encrypt_length,
-                                                  hashed_data,
-                                                  hashed_length,
-                                                  &key->symkey);
-                TPM_Free(hashed_data);
+                rc = SWTPM_PrependHMAC(tmp_data, tmp_length,
+                                       encrypt_data, encrypt_length,
+                                       &key->symkey);
+                TPM_Free(tmp_data);
                 break;
             }
         }
@@ -727,11 +786,12 @@ SWTPM_NVRAM_DecryptData(const encryptionkey *key,
                         unsigned char **decrypt_data,
                         uint32_t *decrypt_length,
                         const unsigned char *encrypt_data,
-                        uint32_t encrypt_length)
+                        uint32_t encrypt_length,
+                        uint8_t hdrversion)
 {
     TPM_RESULT rc = 0;
-    unsigned char *hashed_data = NULL;
-    uint32_t hashed_length = 0;
+    unsigned char *tmp_data = NULL;
+    uint32_t tmp_length = 0;
 
     if (rc == 0) {
         if (key->symkey.valid) {
@@ -740,17 +800,34 @@ SWTPM_NVRAM_DecryptData(const encryptionkey *key,
                 rc = TPM_BAD_MODE;
                 break;
             case ENCRYPTION_MODE_AES_CBC:
-                rc = TPM_SymmetricKeyData_Decrypt(&hashed_data,
-                                                  &hashed_length,
-                                                  encrypt_data,
-                                                  encrypt_length,
-                                                  &key->symkey);
-                if (rc == TPM_SUCCESS) {
-                    rc = SWTPM_CheckHash(hashed_data, hashed_length,
-                                         decrypt_data, decrypt_length);
-                    TPM_Free(hashed_data);
-                }
+                switch (hdrversion) {
+                case 1:
+                    rc = TPM_SymmetricKeyData_Decrypt(&tmp_data,
+                                                      &tmp_length,
+                                                      encrypt_data,
+                                                      encrypt_length,
+                                                      &key->symkey);
+                    if (rc == TPM_SUCCESS) {
+                        rc = SWTPM_CheckHash(tmp_data, tmp_length,
+                                             decrypt_data, decrypt_length);
+                    }
                 break;
+                case 2:
+                    rc = SWTPM_CheckHMAC(encrypt_data, encrypt_length,
+                                         &tmp_data, &tmp_length,
+                                         &key->symkey);
+                    if (rc == TPM_SUCCESS) {
+                        rc = TPM_SymmetricKeyData_Decrypt(decrypt_data,
+                                                          decrypt_length,
+                                                          tmp_data,
+                                                          tmp_length,
+                                                          &key->symkey);
+                    }
+                break;
+                default:
+                    rc = TPM_FAIL;
+                }
+                TPM_Free(tmp_data);
             }
         }
     }
@@ -770,7 +847,7 @@ SWTPM_NVRAM_PrependHeader(unsigned char **data, uint32_t *length,
     uint32_t out_len = sizeof(blobheader) + *length;
     blobheader bh = {
         .version = BLOB_HEADER_VERSION,
-        .min_version = BLOB_HEADER_VERSION,
+        .min_version = 1,
         .hdrsize = htons(sizeof(bh)),
         .flags = htons(flags),
         .totlen = htonl(out_len),
@@ -802,7 +879,8 @@ SWTPM_NVRAM_PrependHeader(unsigned char **data, uint32_t *length,
 
 static TPM_RESULT
 SWTPM_NVRAM_CheckHeader(unsigned char *data, uint32_t length,
-                        uint32_t *dataoffset, uint16_t *hdrflags)
+                        uint32_t *dataoffset, uint16_t *hdrflags,
+                        uint8_t *hdrversion)
 {
     blobheader *bh = (blobheader *)data;
 
@@ -826,6 +904,7 @@ SWTPM_NVRAM_CheckHeader(unsigned char *data, uint32_t length,
         return TPM_BAD_VERSION;
     }
 
+    *hdrversion = bh->version;
     *dataoffset = ntohs(bh->hdrsize);
     *hdrflags = ntohs(bh->flags);
 
@@ -909,6 +988,7 @@ TPM_RESULT SWTPM_NVRAM_SetStateBlob(unsigned char *data,
     unsigned char *plain = NULL;
     uint32_t plain_len = 0;
     uint16_t hdrflags;
+    uint8_t hdrversion;
 
     if (length == 0) {
         /* with 0 bytes length we delete any existing file */
@@ -916,7 +996,8 @@ TPM_RESULT SWTPM_NVRAM_SetStateBlob(unsigned char *data,
         return TPM_SUCCESS;
     }
 
-    res = SWTPM_NVRAM_CheckHeader(data, length, &dataoffset, &hdrflags);
+    res = SWTPM_NVRAM_CheckHeader(data, length, &dataoffset, &hdrflags,
+                                  &hdrversion);
     if (res != TPM_SUCCESS)
         return res;
 
@@ -932,7 +1013,8 @@ TPM_RESULT SWTPM_NVRAM_SetStateBlob(unsigned char *data,
           */
          res = SWTPM_NVRAM_DecryptData(&migrationkey,
                                        &plain, &plain_len,
-                                       &data[dataoffset], length - dataoffset);
+                                       &data[dataoffset], length - dataoffset,
+                                       hdrversion);
          if (res != 0)
             logprintf(STDERR_FILENO,
                       "SWTPM_NVRAM_LoadData: Decrypting the state blob "
